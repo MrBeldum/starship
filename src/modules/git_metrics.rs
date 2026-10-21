@@ -52,7 +52,7 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
                 self.deleted += c.removals;
             }
         }
-        let status = super::git_status::get_static_repo_status(context, repo, &status_config)?;
+        let status = super::git_status::get_static_repo_status_with_changes(context, repo, &status_config)?;
         let gix_repo = gix_repo.with_object_memory();
         gix_repo.write_blob([]).ok()?; /* create empty blob */
         let tree_index_cache = prevent_external_diff(

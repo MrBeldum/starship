@@ -39,6 +39,7 @@ mod git_commit;
 mod git_metrics;
 mod git_state;
 pub mod git_status;
+pub(crate) mod git_status_cache;
 mod gleam;
 mod golang;
 mod gradle;

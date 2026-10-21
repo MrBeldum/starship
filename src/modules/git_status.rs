@@ -1,5 +1,6 @@
 use super::utils::format;
 use super::{Context, Module, ModuleConfig};
+use super::git_status_cache::{self, CachedStatus, Fingerprint, LookupOutcome, StatusCounts};
 use crate::configs::git_status::GitStatusConfig;
 use crate::formatter::StringFormatter;
 use crate::segment::Segment;
@@ -220,10 +221,14 @@ impl<'a> GitStatusInfo<'a> {
     pub fn get_repo_status(&self) -> Option<&RepoStatus> {
         self.repo_status
             .get_or_init(|| {
-                get_static_repo_status(self.context, self.repo, &self.config).or_else(|| {
-                    log::debug!("get_repo_status: git status execution failed");
-                    None
-                })
+                // The module only needs counts, never the full change list,
+                // so the persistent cache is eligible (`need_changes=false`).
+                get_repo_status(self.context, self.repo, &self.config, false)
+                    .map(|result| Arc::new(result.status))
+                    .or_else(|| {
+                        log::debug!("get_repo_status: git status execution failed");
+                        None
+                    })
             })
             .as_deref()
     }
@@ -303,22 +308,53 @@ impl<'a> GitStatusInfo<'a> {
 /// path so the cache is trashed.
 ///
 /// The trashing is only expected when tests run though, as otherwise one path is used with a variety of modules.
-pub fn get_static_repo_status(
+/// Like [`get_repo_status`], but guarantees the returned status carries
+/// the full per-change list (`RepoStatus.changes`), recomputing if necessary.
+/// Used by `git_metrics`, which needs the individual changes for diff stats.
+pub fn get_static_repo_status_with_changes(
     context: &Context,
     repo: &context::GitRepo,
     config: &GitStatusConfig,
 ) -> Option<Arc<RepoStatus>> {
-    static REPO_STATUS: parking_lot::Mutex<Option<(Arc<RepoStatus>, PathBuf)>> =
+    get_static_repo_status_inner(context, repo, config, true)
+}
+
+fn get_static_repo_status_inner(
+    context: &Context,
+    repo: &context::GitRepo,
+    config: &GitStatusConfig,
+    need_changes: bool,
+) -> Option<Arc<RepoStatus>> {
+    static REPO_STATUS: parking_lot::Mutex<Option<(Arc<RepoStatus>, PathBuf, bool)>> =
         parking_lot::Mutex::new(None);
     let mut status = REPO_STATUS.lock();
-    let needs_update = status
-        .as_ref()
-        .is_none_or(|(_status, status_path)| status_path != &context.current_dir);
+    let needs_update = match status.as_ref() {
+        None => true,
+        Some((_, status_path, changes_complete)) => {
+            status_path != &context.current_dir || (need_changes && !changes_complete)
+        }
+    };
     if needs_update {
-        *status = get_repo_status(context, repo, config)
-            .map(|status| (Arc::new(status), context.current_dir.clone()));
+        let repo_status = get_repo_status(context, repo, config, need_changes)?;
+        // A persistent-cache hit carries no change list; only a fresh
+        // computation produces a complete one.
+        let changes_complete = repo_status.changes_complete;
+        *status = Some((
+            Arc::new(repo_status.status),
+            context.current_dir.clone(),
+            changes_complete,
+        ));
     }
-    status.as_ref().map(|(status, _)| Arc::clone(status))
+    status.as_ref().map(|(status, _, _)| Arc::clone(status))
+}
+
+/// Whether `get_repo_status` should consult the persistent worktree-state
+/// cache, and whether the returned status carries a complete change list.
+struct RepoStatusResult {
+    status: RepoStatus,
+    /// `true` when `status.changes` is complete (fresh computation), `false`
+    /// when it came from the persistent cache (counts only).
+    changes_complete: bool,
 }
 
 /// Gets the number of files in various git states (staged, modified, deleted, etc...)
@@ -326,14 +362,216 @@ fn get_repo_status(
     context: &Context,
     repo: &context::GitRepo,
     config: &GitStatusConfig,
-) -> Option<RepoStatus> {
+    need_changes: bool,
+) -> Option<RepoStatusResult> {
     log::debug!("New repo status created");
 
-    let mut repo_status = RepoStatus::default();
     let gix_repo = repo.open();
+    let use_git = repo.use_git_executable(config.use_git_executable)?;
+    let workdir = gix_repo.workdir()?;
+
+    // Persistent worktree-state cache: when the index stat cache is stale,
+    // every status computation re-scans the whole worktree, and nothing ever
+    // re-warms the on-disk cache (the git CLI cannot persist it because of
+    // GIT_OPTIONAL_LOCKS=0, and gitoxide never writes the index). Memoize the
+    // counts in starship's own cache directory instead. The repository itself
+    // is only ever read: no index writes, no lock files.
+    // Skipped when the caller needs the full change list (git_metrics).
+    let cache_lookup = if need_changes {
+        LookupOutcome::Skip
+    } else {
+        git_status_cache::lookup(
+            &repo.path,
+            workdir,
+            &gix_repo,
+            &status_config_key(config, use_git, context),
+        )
+    };
+    match cache_lookup {
+        LookupOutcome::Hit {
+            status: cached,
+            fingerprint,
+        } => {
+            // Upstream tracking can change via fetch without touching the
+            // worktree, so re-validate it with the cheap for-each-ref call
+            // (no worktree scan) instead of trusting the cached value.
+            match revalidate_ahead_behind(context, repo, config, &cached) {
+                Some(validated) => {
+                    log::debug!("git_status: serving from persistent cache");
+                    return Some(RepoStatusResult {
+                        status: repo_status_from_cached(&validated),
+                        changes_complete: false,
+                    });
+                }
+                None => {
+                    log::debug!(
+                        "git_status: persistent cache invalidated by upstream change, recomputing"
+                    );
+                    // Fall through to the full computation, reusing the
+                    // fingerprint we already computed for the store below.
+                    return full_repo_status(
+                        context,
+                        repo,
+                        config,
+                        &gix_repo,
+                        use_git,
+                        Some(&fingerprint),
+                    );
+                }
+            }
+        }
+        LookupOutcome::Miss { fingerprint } => {
+            return full_repo_status(
+                context,
+                repo,
+                config,
+                &gix_repo,
+                use_git,
+                Some(&fingerprint),
+            );
+        }
+        LookupOutcome::Skip => {}
+    }
+    full_repo_status(context, repo, config, &gix_repo, use_git, None)
+}
+
+/// The key of the starship-side configuration options that change *what*
+/// `get_repo_status` computes (as opposed to how the result is displayed).
+fn status_config_key(
+    config: &GitStatusConfig,
+    use_git: bool,
+    context: &Context,
+) -> String {
+    format!(
+        "u{}r{}b{}s{}g{}t{}",
+        !config.untracked.is_empty(),
+        !config.renamed.is_empty(),
+        !config.ahead.is_empty()
+            || !config.behind.is_empty()
+            || !config.up_to_date.is_empty()
+            || !config.diverged.is_empty(),
+        config.ignore_submodules,
+        use_git,
+        context.root_config.command_timeout,
+    )
+}
+
+/// Re-validate cached ahead/behind counts against the live upstream state.
+/// Returns `None` when the tracking info changed (or cannot be determined),
+/// in which case the caller must recompute.
+fn revalidate_ahead_behind(
+    context: &Context,
+    repo: &context::GitRepo,
+    config: &GitStatusConfig,
+    cached: &CachedStatus,
+) -> Option<CachedStatus> {
+    let wants_tracking = !config.ahead.is_empty()
+        || !config.behind.is_empty()
+        || !config.up_to_date.is_empty()
+        || !config.diverged.is_empty();
+    if !wants_tracking {
+        return Some(cached.clone());
+    }
+    let gix_repo = repo.open();
+    let branch_name = gix_repo.head_name().ok().flatten().and_then(|ref_name| {
+        Vec::from(gix::bstr::BString::from(ref_name))
+            .into_string()
+            .ok()
+    });
+    // No branch name (e.g. detached HEAD): the full computation cannot
+    // determine tracking info either, so the cached value stands.
+    let branch_name = match branch_name {
+        Some(branch_name) => branch_name,
+        None => return Some(cached.clone()),
+    };
+    let output = repo.exec_git_with_required_trust(
+        context,
+        gix::sec::Trust::Reduced,
+        ["for-each-ref", "--format", "%(upstream) %(upstream:track)"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .chain(Some(branch_name)),
+    )?;
+    let mut probe = RepoStatus::default();
+    if let Some(line) = output.stdout.lines().next() {
+        probe.set_ahead_behind_for_each_ref(line);
+    }
+    if probe.ahead == cached.ahead && probe.behind == cached.behind {
+        Some(cached.clone())
+    } else {
+        None
+    }
+}
+
+/// Convert a freshly computed status into its cacheable form.
+fn cached_status_from_repo_status(status: &RepoStatus) -> CachedStatus {
+    CachedStatus {
+        counts: StatusCounts {
+            conflicted: status.conflicted,
+            deleted: status.deleted,
+            renamed: status.renamed,
+            modified: status.modified,
+            staged: status.staged,
+            typechanged: status.typechanged,
+            untracked: status.untracked,
+            worktree_added: status.worktree_added,
+            worktree_deleted: status.worktree_deleted,
+            worktree_modified: status.worktree_modified,
+            worktree_typechanged: status.worktree_typechanged,
+            index_added: status.index_added,
+            index_deleted: status.index_deleted,
+            index_modified: status.index_modified,
+            index_typechanged: status.index_typechanged,
+        },
+        ahead: status.ahead,
+        behind: status.behind,
+    }
+}
+
+/// Rebuild a status from a cache hit. The change list is always empty here;
+/// callers that need it (`git_metrics`) bypass the persistent cache.
+fn repo_status_from_cached(cached: &CachedStatus) -> RepoStatus {
+    let counts = &cached.counts;
+    RepoStatus {
+        ahead: cached.ahead,
+        behind: cached.behind,
+        changes: Vec::new(),
+        conflicted: counts.conflicted,
+        deleted: counts.deleted,
+        renamed: counts.renamed,
+        modified: counts.modified,
+        staged: counts.staged,
+        typechanged: counts.typechanged,
+        untracked: counts.untracked,
+        worktree_added: counts.worktree_added,
+        worktree_deleted: counts.worktree_deleted,
+        worktree_modified: counts.worktree_modified,
+        worktree_typechanged: counts.worktree_typechanged,
+        index_added: counts.index_added,
+        index_deleted: counts.index_deleted,
+        index_modified: counts.index_modified,
+        index_typechanged: counts.index_typechanged,
+    }
+}
+
+/// The full (uncached) status computation: gitoxide, or the git executable
+/// where required. When `fingerprint` is given, the fresh result is stored in
+/// the persistent cache under it.
+fn full_repo_status(
+    context: &Context,
+    repo: &context::GitRepo,
+    config: &GitStatusConfig,
+    gix_repo: &gix::Repository,
+    use_git: bool,
+    fingerprint: Option<&Fingerprint>,
+) -> Option<RepoStatusResult> {
+    let mut repo_status = RepoStatus::default();
     let has_untracked = !config.untracked.is_empty();
     let git_config = gix_repo.config_snapshot();
-    if repo.use_git_executable(config.use_git_executable)? {
+    // Set for the gitoxide path when the status run is interrupted by the
+    // command timeout; interrupted results are never cached.
+    let mut interrupted = false;
+    if use_git {
         let mut args = vec!["status", "--porcelain=2"];
 
         // for performance reasons, only pass flags if necessary...
@@ -550,7 +788,8 @@ fn get_repo_status(
             // Keep it for potential reuse by `git_metrics`
             repo_status.changes.push(change);
         }
-        if is_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+        interrupted = is_interrupted.load(std::sync::atomic::Ordering::Relaxed);
+        if interrupted {
             repo_status = RepoStatus {
                 ahead: repo_status.ahead,
                 behind: repo_status.behind,
@@ -559,7 +798,24 @@ fn get_repo_status(
         }
     }
 
-    Some(repo_status)
+    if let Some(fingerprint) = fingerprint
+        && !interrupted
+    {
+        // The repository itself was only read; publish the counts to
+        // starship's own cache directory for the next prompt render.
+        git_status_cache::store(
+            &repo.path,
+            fingerprint,
+            &cached_status_from_repo_status(&repo_status),
+        );
+    }
+
+    Some(RepoStatusResult {
+        status: repo_status,
+        // The git-executable path never produces a change list (git_metrics
+        // runs its own diff there); only the gitoxide computation does.
+        changes_complete: !use_git,
+    })
 }
 
 fn sanitize_rename_tracking(mut config: gix::diff::Rewrites) -> gix::diff::Rewrites {
